@@ -257,6 +257,9 @@
     <div class="hint">Nicely done.</div>
   </section>
 
+  <!-- TEMP: audio status readout for on-device diagnosis -->
+  <div id="adbg" style="position:fixed;left:0;right:0;bottom:4px;text-align:center;font-size:11px;color:#7a828c;font-family:monospace;"></div>
+
   <script>
   (() => {
     "use strict";
@@ -290,25 +293,60 @@
     let durationMin = Number(store.get("durationMin", 10));
     let prerollSec = Number(store.get("prerollSec", 7));
 
-    // ---------- audio (Web Audio, unlocked on first tap) ----------
+    // ---------- audio (Web Audio) ----------
+    // iOS Safari only lets Web Audio make sound if it is unlocked SYNCHRONOUSLY
+    // inside a tap: resume() + play a source, with NO await before it. So we
+    // unlock in the click handler (unlockAudio) and pre-decode the bell at load,
+    // keeping the tap path synchronous. Desktop doesn't need this, but it's
+    // harmless there.
     let audioCtx = null;
     let bellBuffer = null;
     let bellLoading = null;
+    let audioUnlocked = false;
 
-    function ensureAudio() {
+    function makeCtx() {
       if (!audioCtx) {
         const AC = window.AudioContext || window.webkitAudioContext;
         audioCtx = new AC();
       }
+      return audioCtx;
+    }
+
+    // MUST be called synchronously from inside a user gesture. No await before it.
+    function unlockAudio() {
+      makeCtx();
+      if (audioCtx.state === "suspended") audioCtx.resume();
+      if (!audioUnlocked) {
+        // a 1-sample silent buffer played in-gesture is the canonical iOS unlock
+        const b = audioCtx.createBuffer(1, 1, 22050);
+        const s = audioCtx.createBufferSource();
+        s.buffer = b;
+        s.connect(audioCtx.destination);
+        s.start(0);
+        audioUnlocked = true;
+      }
+      updateAudioDbg();
+    }
+
+    // Load + decode the bell. Safe to start at page load (decode works on a
+    // suspended context), so the buffer is ready before the first tap.
+    function ensureAudio() {
+      makeCtx();
       if (audioCtx.state === "suspended") audioCtx.resume();
       if (!bellBuffer && !bellLoading) {
         bellLoading = fetch(BELL_URL)
           .then(r => r.arrayBuffer())
           .then(buf => new Promise((res, rej) => audioCtx.decodeAudioData(buf, res, rej)))
-          .then(b => { bellBuffer = b; })
-          .catch(err => console.warn("bell load failed", err));
+          .then(b => { bellBuffer = b; updateAudioDbg(); })
+          .catch(err => { console.warn("bell load failed", err); updateAudioDbg(); });
       }
       return bellLoading || Promise.resolve();
+    }
+
+    function updateAudioDbg() {
+      const el = document.getElementById("adbg");
+      if (el) el.textContent = "audio: ctx=" + (audioCtx ? audioCtx.state : "none") +
+        " · unlocked=" + audioUnlocked + " · bell=" + (bellBuffer ? "ready" : "loading");
     }
 
     // Bells are scheduled on the Web Audio clock, not on JS timers. The audio
@@ -399,6 +437,7 @@
         timeDisplay.textContent = fmt(remaining);
         if (remaining <= 0) finishSession(false);
       }
+      updateAudioDbg();   // keep the on-device audio readout live
     }
 
     function startLoop() {
@@ -554,16 +593,22 @@
     });
 
     // ---------- control wiring ----------
-    startBtn.addEventListener("click", begin);
+    // unlockAudio() runs FIRST and synchronously — it must be inside the tap,
+    // before begin()'s awaits, or iOS keeps the audio muted.
+    startBtn.addEventListener("click", () => { unlockAudio(); begin(); });
     againBtn.addEventListener("click", reset);
     pauseBtn.addEventListener("click", () => {
       if (state.phase === "running") pause();
-      else if (state.phase === "paused") resume();
+      else if (state.phase === "paused") { unlockAudio(); resume(); }
     });
     endBtn.addEventListener("click", () => {
       if (state.phase === "preroll") reset();   // abort the settle countdown, no bell
       else if (state.phase === "running" || state.phase === "paused") finishSession(true);
     });
+
+    // Pre-decode the bell at load so the buffer is ready before the first tap.
+    ensureAudio();
+    updateAudioDbg();
 
     // ---------- service worker ----------
     if ("serviceWorker" in navigator) {
