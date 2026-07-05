@@ -257,14 +257,15 @@
     <div class="hint">Nicely done.</div>
   </section>
 
+  <!-- Bell as a media element so it plays through the iOS mute switch. -->
+  <audio id="bellAudio" src="audio/535950__mttvn__e-flat-tibetan-singing-bowl-struck.wav" preload="auto" playsinline></audio>
+
   <!-- TEMP: audio status readout for on-device diagnosis -->
   <div id="adbg" style="position:fixed;left:0;right:0;bottom:4px;text-align:center;font-size:11px;color:#7a828c;font-family:monospace;"></div>
 
   <script>
   (() => {
     "use strict";
-
-    const BELL_URL = "audio/535950__mttvn__e-flat-tibetan-singing-bowl-struck.wav";
 
     // ---------- element refs ----------
     const screens = {
@@ -293,95 +294,55 @@
     let durationMin = Number(store.get("durationMin", 10));
     let prerollSec = Number(store.get("prerollSec", 7));
 
-    // ---------- audio (Web Audio) ----------
-    // iOS Safari only lets Web Audio make sound if it is unlocked SYNCHRONOUSLY
-    // inside a tap: resume() + play a source, with NO await before it. So we
-    // unlock in the click handler (unlockAudio) and pre-decode the bell at load,
-    // keeping the tap path synchronous. Desktop doesn't need this, but it's
-    // harmless there.
-    let audioCtx = null;
-    let bellBuffer = null;
-    let bellLoading = null;
+    // ---------- audio (HTML <audio> element) ----------
+    // Deliberately an <audio> element, NOT the Web Audio API: iOS routes Web
+    // Audio through the "ambient" category, which the hardware mute switch
+    // silences. iOS treats <audio> as media playback, which plays THROUGH the
+    // mute switch (same reason web video makes sound on silent). It still needs
+    // unlocking by a real tap: play it once (muted) inside the gesture, after
+    // which it can be played on demand. Trade-off vs Web Audio scheduling: bells
+    // are triggered by the timer loop, so they rely on the app staying in front
+    // (which it does during a sit, with the screen held awake).
+    const bellAudio = document.getElementById("bellAudio");
     let audioUnlocked = false;
+    let lastPlay = "-";
 
-    function makeCtx() {
-      if (!audioCtx) {
-        const AC = window.AudioContext || window.webkitAudioContext;
-        audioCtx = new AC();
-      }
-      return audioCtx;
-    }
-
-    // MUST be called synchronously from inside a user gesture. No await before it.
+    // MUST be called synchronously from inside a user gesture. No await first.
     function unlockAudio() {
-      makeCtx();
-      if (audioCtx.state === "suspended") audioCtx.resume();
-      if (!audioUnlocked) {
-        // a 1-sample silent buffer played in-gesture is the canonical iOS unlock
-        const b = audioCtx.createBuffer(1, 1, 22050);
-        const s = audioCtx.createBufferSource();
-        s.buffer = b;
-        s.connect(audioCtx.destination);
-        s.start(0);
+      if (audioUnlocked || !bellAudio) { updateAudioDbg(); return; }
+      bellAudio.muted = true;
+      const done = () => {
+        // if a real ring already took over (unmuted it), don't stop it
+        if (bellAudio.muted) { try { bellAudio.pause(); bellAudio.currentTime = 0; } catch {} bellAudio.muted = false; }
         audioUnlocked = true;
-      }
-      updateAudioDbg();
+        updateAudioDbg();
+      };
+      const p = bellAudio.play();
+      if (p && p.then) p.then(done, () => { bellAudio.muted = false; updateAudioDbg(); });
+      else done();
     }
 
-    // Load + decode the bell. Safe to start at page load (decode works on a
-    // suspended context), so the buffer is ready before the first tap.
-    function ensureAudio() {
-      makeCtx();
-      if (audioCtx.state === "suspended") audioCtx.resume();
-      if (!bellBuffer && !bellLoading) {
-        bellLoading = fetch(BELL_URL)
-          .then(r => r.arrayBuffer())
-          .then(buf => new Promise((res, rej) => audioCtx.decodeAudioData(buf, res, rej)))
-          .then(b => { bellBuffer = b; updateAudioDbg(); })
-          .catch(err => { console.warn("bell load failed", err); updateAudioDbg(); });
-      }
-      return bellLoading || Promise.resolve();
+    // Ring the bell now (from the top). Safe to call outside a gesture once
+    // unlocked. Resetting currentTime lets it re-ring even if still decaying.
+    function ringBell() {
+      if (!bellAudio) return;
+      try {
+        bellAudio.muted = false;
+        bellAudio.currentTime = 0;
+        const p = bellAudio.play();
+        if (p && p.then) p.then(
+          () => { lastPlay = "ok"; updateAudioDbg(); },
+          (e) => { lastPlay = "ERR:" + ((e && e.name) || e); updateAudioDbg(); }
+        );
+      } catch (e) { lastPlay = "throw"; }
+      updateAudioDbg();
     }
 
     function updateAudioDbg() {
       const el = document.getElementById("adbg");
-      if (el) el.textContent = "audio: ctx=" + (audioCtx ? audioCtx.state : "none") +
-        " · unlocked=" + audioUnlocked + " · bell=" + (bellBuffer ? "ready" : "loading");
-    }
-
-    // Bells are scheduled on the Web Audio clock, not on JS timers. The audio
-    // thread keeps its own time and fires scheduled sources even while the
-    // display loop is throttled (tab hidden / screen off), and it carries the
-    // Start-tap gesture permission forward to bells that ring seconds later.
-    let scheduledBells = [];
-
-    // schedule a bell at an absolute AudioContext time; past times ring now.
-    // returns the source node so a still-pending bell can be cancelled.
-    function scheduleBell(ctxTime) {
-      if (!audioCtx || !bellBuffer) return null;
-      if (audioCtx.state === "suspended") audioCtx.resume();
-      const src = audioCtx.createBufferSource();
-      src.buffer = bellBuffer;
-      src.connect(audioCtx.destination);
-      src.start(Math.max(audioCtx.currentTime, ctxTime));
-      scheduledBells.push(src);
-      src.onended = () => { scheduledBells = scheduledBells.filter(s => s !== src); };
-      return src;
-    }
-
-    function ringBellNow() {
-      return scheduleBell(audioCtx ? audioCtx.currentTime : 0);
-    }
-
-    function cancelBell(src) {
-      if (!src) return;
-      try { src.stop(); } catch {}
-      scheduledBells = scheduledBells.filter(s => s !== src);
-    }
-
-    function cancelAllBells() {
-      for (const s of scheduledBells.slice()) { try { s.stop(); } catch {} }
-      scheduledBells = [];
+      if (!el) return;
+      const rs = bellAudio ? bellAudio.readyState : "no-el";
+      el.textContent = "audio: unlocked=" + audioUnlocked + " · ready=" + rs + " · lastPlay=" + lastPlay;
     }
 
     // ---------- wake lock ----------
@@ -409,7 +370,6 @@
       endAt: 0,          // absolute ms when current phase ends
       remainingMs: 0,    // used while paused
       sessionMs: 0,      // total meditation length (excludes preroll)
-      endBellSrc: null,  // scheduled end-bell source (for cancel on pause/end)
       timer: null,       // setInterval id for the display loop
     };
 
@@ -450,40 +410,35 @@
     }
 
     // ---- transitions ----
-    // The Start tap schedules BOTH bells on the audio clock up front, so they
-    // fire on time regardless of what the display loop does afterwards.
-    async function begin() {
-      await ensureAudio();               // unlock ctx + finish loading/decoding bell
+    // Bells are rung on demand (ringBell) at the moments they should sound,
+    // driven by the display loop. The loop fires reliably while the app is in
+    // front with the screen held awake — i.e. during a sit.
+    function begin() {
       acquireWakeLock();
       state.sessionMs = durationMin * 60 * 1000;
-      const sessionSec = state.sessionMs / 1000;
-      const at = audioCtx ? audioCtx.currentTime : 0;
       const now = Date.now();
       show("running");
 
       if (prerollSec > 0) {
         state.phase = "preroll";
         state.endAt = now + prerollSec * 1000;
-        scheduleBell(at + prerollSec);                              // start bell
-        state.endBellSrc = scheduleBell(at + prerollSec + sessionSec); // end bell
         phaseLabel.textContent = "Settle in";
         pauseBtn.style.display = "none";   // no pausing the settle countdown; keep End centered
         timeDisplay.textContent = fmt(prerollSec * 1000);
-        startLoop();
+        startLoop();                       // start bell rings at beginSession
       } else {
         state.phase = "running";
         state.endAt = now + state.sessionMs;
-        ringBellNow();                                              // start bell now
-        state.endBellSrc = scheduleBell(at + sessionSec);          // end bell
         phaseLabel.textContent = "";
         pauseBtn.style.display = "";
         pauseBtn.textContent = "Pause";
         timeDisplay.textContent = fmt(state.sessionMs);
+        ringBell();                        // start bell now
         startLoop();
       }
     }
 
-    // UI-only transition from preroll to the sit (bells already scheduled).
+    // Transition from preroll into the sit; ring the start bell.
     function beginSession() {
       state.phase = "running";
       state.endAt = state.endAt + state.sessionMs;  // preroll-end + session length
@@ -491,14 +446,13 @@
       pauseBtn.style.display = "";
       pauseBtn.textContent = "Pause";
       timeDisplay.textContent = fmt(Math.max(0, state.endAt - Date.now()));
+      ringBell();                          // settle countdown just ended
       startLoop();
     }
 
     function pause() {
       if (state.phase !== "running") return;
       state.remainingMs = Math.max(0, state.endAt - Date.now());
-      cancelBell(state.endBellSrc);        // pull the scheduled end bell
-      state.endBellSrc = null;
       state.phase = "paused";
       stopLoop();
       pauseBtn.textContent = "Resume";
@@ -510,9 +464,6 @@
       if (state.phase !== "paused") return;
       state.phase = "running";
       state.endAt = Date.now() + state.remainingMs;   // recompute fresh end
-      if (audioCtx) {
-        state.endBellSrc = scheduleBell(audioCtx.currentTime + state.remainingMs / 1000);
-      }
       pauseBtn.textContent = "Pause";
       phaseLabel.textContent = "";
       acquireWakeLock();
@@ -526,13 +477,7 @@
       const remaining = state.phase === "paused"
         ? state.remainingMs
         : Math.max(0, state.endAt - Date.now());
-      if (early) {
-        cancelBell(state.endBellSrc);      // cancel the future end bell...
-        state.endBellSrc = null;
-        ringBellNow();                     // ...and ring a clean close now
-      }
-      // natural end: the scheduled end bell already rang — don't double-ring
-      state.endBellSrc = null;
+      ringBell();                          // end bell (a clean close on early end too)
       state.phase = "finished";
       finishedLabel.textContent = early ? "Ended" : "Complete";
       const satMs = early ? Math.max(0, state.sessionMs - remaining) : state.sessionMs;
@@ -543,8 +488,6 @@
     function reset() {
       stopLoop();
       releaseWakeLock();
-      cancelAllBells();          // clears both start + end bells if any are pending
-      state.endBellSrc = null;
       state.phase = "idle";
       show("setup");
     }
@@ -606,8 +549,7 @@
       else if (state.phase === "running" || state.phase === "paused") finishSession(true);
     });
 
-    // Pre-decode the bell at load so the buffer is ready before the first tap.
-    ensureAudio();
+    // The <audio preload="auto"> element loads the bell on its own.
     updateAudioDbg();
 
     // ---------- service worker ----------

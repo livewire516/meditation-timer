@@ -1,6 +1,6 @@
 // Sit — service worker. Cache-first so a sit never touches the network.
 // Bump CACHE when any precached asset changes to force a refresh.
-const CACHE = "sit-v1";
+const CACHE = "sit-v2";
 
 const ASSETS = [
   ".",
